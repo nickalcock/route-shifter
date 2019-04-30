@@ -1,0 +1,178 @@
+#!/usr/bin/perl -w
+#
+# route-shifter --- Shift routes about as needed for bonded / fallback lines.
+#
+#                   Hacked up by Nick Alcock <nix@esperi.org.uk>
+#
+#                   Licensed under the GPLv3+.
+#
+
+use strict;
+use warnings;
+use IPC::Run qw (run);
+use Net::Ping;
+use POSIX 'setsid';
+use YAML qw(LoadFile);
+use JSON;
+
+# Terminology: interfaces are grouped into 'bonding groups', each of which
+# consists of some number of network interfaces. Each NIC has an associated
+# routing IP address and weight for the multihop route, and a ping address
+# for upness validation.
+#
+# Bonding groups are prioritized: the highest-priority group with any active
+# interfaces is always used for outbound traffic when possible.  (We do
+# not control inbound traffic.)
+#
+# /etc/route-shifter looks like this, for an asymmetric bonding group with a
+# single non-bonded failover line:
+#
+# adsl: {ip: 1.2.3.4, weight: 1, ping: 20.30.40.50}
+# bdsl: {ip: 1.2.3.5, weight: 2, ping: 20.30.40.50}
+# fallbackdsl: { ip: 60.10.90.1, weight: 1, ping: 60.100.90.40}
+# ---
+# - [adsl, bdsl]
+# - [fallbackdsl]
+
+
+use constant
+{
+    DEBUG => 0,
+    SLEEP => 30,
+    SLOP => 5
+};
+
+# Print a debugging message when DEBUG.
+sub debug
+  {
+    my (@msg) = @_;
+
+    if (DEBUG)
+      {
+        my @args = ('logger', '-p', 'daemon.' . 'debug', '-t', 'route-shifter');
+
+        push @args, '-s' if DEBUG;
+        push @args, @msg;
+
+        run (\@args);
+      }
+  }
+
+# Log a message.
+sub Log
+{
+    my (@msg) = @_;
+    debug(@msg);
+    run (['logger', '-p', 'daemon.' . 'info', '-t', 'route-shifter', '-s', @msg]);
+}
+
+# Die.
+sub fail
+{
+    my (@msg) = @_;
+    Log(@msg);
+    exit(1);
+}
+
+# Become a daemon.
+sub daemonize
+  {
+    chdir '/' or die "Can't chdir to /: $!";
+    open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+    open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+    defined (my $pid = fork) or die "Can't fork: $!";
+    exit if $pid;
+    setsid or die "Can't start a new session: $!";
+    open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+  }
+
+my ($interfaces, $bondgroups) = LoadFile ("/etc/route-shifter.conf")
+    or die "Cannot load /etc/route-shifter: $!\n";
+
+for my $interface (keys %{$interfaces})
+{
+    $interfaces->{$interface}->{pinger} = Net::Ping->new ('icmp', 5, 0, $interface, 0x10)
+        or die "Cannot initialize pinger on interface $interface: $!\n";
+    $interfaces->{$interface}->{packets} = 0;
+}
+
+daemonize() unless DEBUG;
+
+# Get the count of received packets on all interfaces since the last try: mark
+# interfaces as alive accordingly.
+sub ifstat
+{
+    my %ifs_up;
+    my $ifstat_output;
+    run (['/sbin/ifstat', '-j', keys %{$interfaces}], \undef, \$ifstat_output)
+        or fail("Cannot invoke ifstat: $!\n");
+    my $ifstat = eval { decode_json($ifstat_output); };
+    fail("Cannot decode ifstat JSON: $@") if $@;
+
+    for my $interface (keys %{$interfaces}) {
+        debug ("checking for liveness of $interface");
+        if (defined($ifstat->{kernel}->{$interface}->{rx_packets}) &&
+            ($ifstat->{kernel}->{$interface}->{rx_packets} > $interfaces->{$interface}->{packets} + SLOP)) {
+            debug ("$interface: live, packet count now " . $ifstat->{kernel}->{$interface}->{rx_packets});
+            $interfaces->{$interface}->{packets} = $ifstat->{kernel}->{$interface}->{rx_packets};
+            debug ("$interface marked up.");
+            $ifs_up{$interface} = 1;
+        }
+    }
+    return %ifs_up;
+}
+
+my @routed_interfaces;
+
+CYCLE: for (;;) {
+    my %ifs_up = ifstat;
+
+    sleep(SLEEP);
+    for my $bondgroup (@{$bondgroups}) {
+
+        my $ping_needed = 0;
+        # See if anything in this bond-group needs pinging.
+
+        for my $interface (@{$bondgroup}) {
+            debug ("scanning $interface");
+            if (!$ifs_up{$interface}) {
+                debug ("Pinging " . $interfaces->{$interface}->{ping} . " on $interface");
+                $ping_needed = 1;
+                # Try to ping twice before giving up.
+                if ($interfaces->{$interface}->{pinger}->ping($interfaces->{$interface}->{ping}) ||
+                    $interfaces->{$interface}->{pinger}->ping($interfaces->{$interface}->{ping})) {
+                    $ifs_up{$interface} = 1;
+                } else {
+                    debug ("(No response.)");
+                }
+            }
+        }
+
+        # Always re-evaluate ifstat after a round of pings: they can take a
+        # while, and perhaps more packets have come in.
+        %ifs_up = (%ifs_up, ifstat) if $ping_needed;
+
+        # At least one live interface in this bonding group.  We will be bringing
+        # this interface up.
+        debug ("checking for upness");
+        if (keys %ifs_up) {
+            my @alive = sort keys %ifs_up;
+            next CYCLE if (@alive == @routed_interfaces);
+
+            @routed_interfaces = @alive;
+
+            Log ("Changing default route to " . join(", ", @alive));
+            if (scalar @routed_interfaces > 0) {
+            run (['/sbin/ip', 'route', 'del', 'default'])
+                or fail("Cannot tear down default route");
+            run (['/sbin/ip', 'route', 'add', 'default',
+                  map { ("nexthop", "via", $interfaces->{$_}->{ip}, "dev", $_,
+                         "weight", $interfaces->{$_}->{weight}) } @routed_interfaces])
+                or fail("Cannot bring up new default route");
+            }
+            next CYCLE;
+        }
+
+        # No live interfaces in this bond group: try the next.
+    }
+}
