@@ -158,7 +158,7 @@ CYCLE: for (;;) {
         debug ("checking for upness");
         if (keys %ifs_up) {
             my @alive = sort keys %ifs_up;
-            next CYCLE if (@alive == @routed_interfaces);
+            next CYCLE if (@alive ~~ @routed_interfaces);
 
             @routed_interfaces = @alive;
 
