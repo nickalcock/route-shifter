@@ -102,6 +102,7 @@ daemonize() unless DEBUG;
 # interfaces as alive accordingly.
 sub ifstat
 {
+    my ($scanifs) = @_;
     my %ifs_up;
     my $ifstat_output;
     run (['/sbin/ifstat', '-j', keys %{$interfaces}], \undef, \$ifstat_output)
@@ -109,12 +110,12 @@ sub ifstat
     my $ifstat = eval { decode_json($ifstat_output); };
     fail("Cannot decode ifstat JSON: $@") if $@;
 
-    for my $interface (keys %{$interfaces}) {
+    for my $interface (@{$scanifs}) {
         debug ("checking for liveness of $interface");
-        if (defined($ifstat->{kernel}->{$interface}->{rx_packets}) &&
-            ($ifstat->{kernel}->{$interface}->{rx_packets} > $interfaces->{$interface}->{packets} + SLOP)) {
-            debug ("$interface: live, packet count now " . $ifstat->{kernel}->{$interface}->{rx_packets});
-            $interfaces->{$interface}->{packets} = $ifstat->{kernel}->{$interface}->{rx_packets};
+        if (defined($ifstat->{kernel}{$interface}->{rx_packets}) &&
+            ($ifstat->{kernel}{$interface}->{rx_packets} > $interfaces->{$interface}->{packets} + SLOP)) {
+            debug ("$interface: live, packet count now " . $ifstat->{kernel}{$interface}->{rx_packets});
+            $interfaces->{$interface}->{packets} = $ifstat->{kernel}{$interface}->{rx_packets};
             debug ("$interface marked up.");
             $ifs_up{$interface} = 1;
         }
@@ -125,10 +126,10 @@ sub ifstat
 my @routed_interfaces;
 
 CYCLE: for (;;) {
-    my %ifs_up = ifstat;
-
     sleep(SLEEP);
     for my $bondgroup (@{$bondgroups}) {
+
+        my %ifs_up = ifstat ($bondgroup);
 
         my $ping_needed = 0;
         # See if anything in this bond-group needs pinging.
@@ -150,7 +151,7 @@ CYCLE: for (;;) {
 
         # Always re-evaluate ifstat after a round of pings: they can take a
         # while, and perhaps more packets have come in.
-        %ifs_up = (%ifs_up, ifstat) if $ping_needed;
+        %ifs_up = (%ifs_up, ifstat ($bondgroup)) if $ping_needed;
 
         # At least one live interface in this bonding group.  We will be bringing
         # this interface up.
